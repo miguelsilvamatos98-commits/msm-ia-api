@@ -1,103 +1,113 @@
-import express from "express";
-import cors from "cors";
-import multer from "multer";
-import OpenAI from "openai";
+// server.js (CommonJS) - MSM-IA-API
+const express = require("express");
+const multer = require("multer");
+const cors = require("cors");
+const OpenAI = require("openai");
 
 const app = express();
 
-// CORS aberto (para o Hostinger poder chamar)
-app.use(cors());
-app.use(express.json());
+// ✅ CORS (podes deixar "*" para teste; em produção mete o teu domínio)
+app.use(cors({ origin: "*" }));
 
+// ✅ Upload em memória (não grava em disco)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 } // 8MB
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 
-const PORT = process.env.PORT || 3000;
-
-// Health
+// ✅ Health check
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "MSM-IA-API", time: new Date().toISOString() });
 });
 
-// GET explicativo (para não dar confusão)
+// ✅ GET no endpoint de análise: explica que é POST
 app.get("/api/analisar-grafico", (req, res) => {
   res.status(405).json({
     erro: "Use POST",
-    exemplo: "POST /api/analisar-grafico (form-data: grafico=image)"
+    exemplo: "POST /api/analisar-grafico (form-data: grafico=image)",
   });
 });
 
-// POST real
+// ✅ POST: recebe imagem e envia para OpenAI (vision)
 app.post("/api/analisar-grafico", upload.single("grafico"), async (req, res) => {
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ erro: "OPENAI_API_KEY não definida no Render (Environment)." });
+    // 1) validações
+    if (!req.file) {
+      return res.status(400).json({ erro: "Falta o ficheiro", campo: "grafico" });
     }
 
-    if (!req.file) {
-      return res.status(400).json({
-        erro: "Ficheiro não enviado. Envie form-data com a chave 'grafico'.",
-        exemplo: "POST /api/analisar-grafico (form-data: grafico=image)"
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        erro: "OPENAI_API_KEY ausente no Render (Environment Variables).",
       });
     }
 
-    // OpenAI client
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-    // Converter imagem para base64 data url
+    // 2) prepara imagem
     const mime = req.file.mimetype || "image/png";
     const base64 = req.file.buffer.toString("base64");
     const dataUrl = `data:${mime};base64,${base64}`;
 
-    // Prompt (ajusta como quiseres)
-    const system = `És um analista técnico. Responde SEMPRE em JSON puro.
-Campos: sinal (COMPRA|VENDA|NEUTRO), confianca (0-100), resumo (string curta).`;
+    // 3) cliente OpenAI
+    const client = new OpenAI({ apiKey });
 
-    const user = `Analisa o print do gráfico (candlesticks) e devolve sinal para a próxima entrada.
-Não inventes dados. Se não der para ler, devolve NEUTRO com baixa confiança.`;
+    // 4) prompt (ajusta ao teu gosto)
+    const prompt = `
+Analisa o screenshot de um gráfico (candlesticks) de opções binárias.
+Responde APENAS em JSON com:
+{
+  "sinal": "COMPRA" | "VENDA" | "NEUTRO",
+  "confianca": number, 
+  "motivo": string
+}
+- confianca de 0 a 100
+- se a imagem estiver confusa, usa NEUTRO com baixa confiança.
+`;
 
-    // Chamada multimodal (imagem + texto)
-    const r = await client.chat.completions.create({
+    // 5) chamada vision
+    const response = await client.chat.completions.create({
       model: "gpt-4.1-mini",
+      temperature: 0.2,
       messages: [
-        { role: "system", content: system },
+        { role: "system", content: "Responde sempre em JSON válido, sem texto extra." },
         {
           role: "user",
           content: [
-            { type: "text", text: user },
-            { type: "image_url", image_url: { url: dataUrl } }
-          ]
-        }
+            { type: "text", text: prompt.trim() },
+            { type: "image_url", image_url: { url: dataUrl } },
+          ],
+        },
       ],
-      temperature: 0.2
+      response_format: { type: "json_object" },
     });
 
-    const raw = r?.choices?.[0]?.message?.content?.trim() || "";
-
-    // tentar parse JSON
-    let parsed;
+    // 6) parse seguro
+    const content = response?.choices?.[0]?.message?.content || "{}";
+    let json;
     try {
-      parsed = JSON.parse(raw);
+      json = JSON.parse(content);
     } catch {
-      // fallback se vier texto
-      parsed = { sinal: "NEUTRO", confianca: 35, resumo: raw.slice(0, 200) || "Sem leitura." };
+      json = { sinal: "NEUTRO", confianca: 10, motivo: "Resposta inválida do modelo." };
     }
 
-    // normalizar
-    const sinal = String(parsed.sinal || "NEUTRO").toUpperCase();
-    const confianca = Math.max(0, Math.min(100, Number(parsed.confianca ?? 50)));
-    const resumo = String(parsed.resumo || "").slice(0, 500);
+    // 7) normaliza
+    const sinal = (json.sinal || "NEUTRO").toString().toUpperCase();
+    const confianca = Number.isFinite(Number(json.confianca)) ? Number(json.confianca) : 0;
+    const motivo = (json.motivo || "").toString();
 
-    return res.json({ ok: true, sinal, confianca, resumo });
-
+    return res.json({
+      sinal: ["COMPRA", "VENDA", "NEUTRO"].includes(sinal) ? sinal : "NEUTRO",
+      confianca: Math.max(0, Math.min(100, confianca)),
+      motivo,
+    });
   } catch (err) {
-    console.error("ERRO /api/analisar-grafico:", err);
-    return res.status(500).json({ erro: "Erro interno na análise" });
+    console.error(err);
+    return res.status(500).json({
+      erro: "Erro interno na análise",
+      detalhe: err?.message || String(err),
+    });
   }
 });
 
-app.listen(PORT, () => {
-  console.log("MSM-IA-API a correr na porta", PORT);
-});
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log("MSM-IA-API a correr na porta", port));
