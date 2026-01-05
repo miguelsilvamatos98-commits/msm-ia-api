@@ -1,8 +1,8 @@
 {
   "name": "msm-ia-api",
   "version": "1.0.0",
+  "type": "module",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
@@ -13,5 +13,3 @@
     "openai": "^4.60.0"
   }
 }
-
-
