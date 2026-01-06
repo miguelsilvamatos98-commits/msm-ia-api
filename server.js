@@ -2,121 +2,129 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import OpenAI from "openai";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const app = express();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
-/* ===============================
-   UPLOAD CONFIG
-================================ */
-const upload = multer({
-  limits: { fileSize: 5 * 1024 * 1024 } // 5MB
-});
+// ====== CONFIG ======
+const PORT = process.env.PORT || 10000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
-/* ===============================
-   CORS CONFIG (APENAS UMA VEZ)
-================================ */
-const allowedOrigins = [
-  "https://darkturquoise-stork-767325.hostingersite.com",
-  "https://tradespeedpro.click",
-  "http://localhost:3000",
-  "http://localhost:5500"
-];
+// Origem permitida (mete o teu domínio da Hostinger aqui como env)
+// Ex: https://darkturquoise-stork-767325.hostingersite.com
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
+// ====== CORS ======
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("CORS bloqueado"));
-    }
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // Postman/cURL
+    if (ALLOWED_ORIGINS.includes("*")) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("CORS bloqueado: " + origin));
   }
 }));
 
-app.use(express.json());
+// ====== STATIC SITE ======
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-/* ===============================
-   OPENAI
-================================ */
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+// Serve /public como site
+app.use(express.static(path.join(__dirname, "public")));
+
+// Home
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-/* ===============================
-   HEALTH
-================================ */
+// Health
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "MSM-IA-API",
-    time: new Date().toISOString()
-  });
+  res.json({ ok: true, service: "MSM-IA-API", time: new Date().toISOString() });
 });
 
-/* ===============================
-   ANALISAR GRÁFICO
-   - SÓ COMPRA ou VENDA
-   - 1 MINUTO
-================================ */
+// ====== OPENAI CLIENT ======
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// ====== API: analisar gráfico ======
 app.post("/api/analisar-grafico", upload.single("grafico"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ erro: "Imagem não enviada" });
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ erro: "OPENAI_API_KEY em falta no servidor." });
     }
 
-    const imageBase64 = req.file.buffer.toString("base64");
+    if (!req.file) {
+      return res.status(400).json({ erro: "Envie a imagem no form-data: grafico" });
+    }
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `
-És um analista profissional de opções binárias.
-Decide operação de 1 minuto.
+    // imagem em base64
+    const base64 = req.file.buffer.toString("base64");
+    const dataUrl = `data:${req.file.mimetype};base64,${base64}`;
 
-REGRAS:
-- Responde APENAS "COMPRA" ou "VENDA"
-- Nunca escrevas texto extra
-- Baseia-te apenas no gráfico
-`
-        },
+    // Prompt (1 minuto e 30s, ativos específicos)
+    const system = `
+Você é um analista técnico de gráficos (opções binárias). 
+Você deve responder SOMENTE com "COMPRA" ou "VENDA".
+A expiração da operação é de 1 minuto e 30 segundos.
+Use apenas o que é visível no gráfico (tendência, suporte/resistência, momentum, volatilidade).
+Se a imagem estiver ilegível, escolha a opção mais provável com base no que aparece.
+Não escreva explicações, nem "NEUTRO", nem "ERRO".
+`;
+
+    const user = `
+Analise o print do gráfico e retorne a melhor decisão para expiração de 1 minuto e 30 segundos.
+Considere ativos como EUR/USD, GBP/USD, BTC, ETH (se der para identificar no print).
+Responda apenas: COMPRA ou VENDA.
+`;
+
+    const response = await client.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        { role: "system", content: system.trim() },
         {
           role: "user",
           content: [
-            { type: "text", text: "Analisa o gráfico." },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/png;base64,${imageBase64}`
-              }
-            }
+            { type: "input_text", text: user.trim() },
+            { type: "input_image", image_url: dataUrl }
           ]
         }
-      ],
-      max_tokens: 5
+      ]
     });
 
-    const resposta = completion.choices[0].message.content
-      .toUpperCase()
-      .includes("COMPRA")
-      ? "COMPRA"
-      : "VENDA";
+    // Extrair texto final
+    const out = (response.output_text || "").trim().toUpperCase();
 
-    res.json({
-      sinal: resposta,
-      duracao: "1 minuto"
+    // Garantir só COMPRA/VENDA
+    const sinal = out.includes("VENDA") ? "VENDA" : "COMPRA";
+
+    return res.json({
+      ok: true,
+      sinal,
+      expiracao: "1m30s",
+      time: new Date().toISOString()
     });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ erro: "Erro interno" });
+    console.error("Erro /api/analisar-grafico:", err?.message || err);
+
+    // erro “sem créditos” / quota / 429
+    const msg = String(err?.message || "");
+    if (msg.includes("429") || msg.toLowerCase().includes("quota") || msg.toLowerCase().includes("insufficient_quota")) {
+      return res.status(402).json({ erro: "Sem créditos na OpenAI (quota). Carrega saldo e tenta novamente." });
+    }
+
+    return res.status(500).json({ erro: "Erro interno na análise." });
   }
 });
 
-/* ===============================
-   START SERVER
-================================ */
-const PORT = process.env.PORT || 10000;
+// GET neste endpoint devolve “Use POST” (para não aparecer Cannot GET)
+app.get("/api/analisar-grafico", (req, res) => {
+  res.status(405).json({ erro: "Use POST", exemplo: "POST /api/analisar-grafico (form-data: grafico=image)" });
+});
+
 app.listen(PORT, () => {
   console.log("MSM-IA-API a correr na porta", PORT);
 });
