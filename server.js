@@ -7,23 +7,24 @@ import OpenAI from "openai";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ========= CORS (permite o teu Hostinger) =========
-const ALLOWED_ORIGINS = [
+import cors from "cors";
+
+const allowedOrigins = [
   "https://darkturquoise-stork-767325.hostingersite.com",
-  "http://localhost:3000",
-  "http://localhost:5173",
+  "https://tradespeedpro.click",
+  "http://localhost:5500"
 ];
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // Postman/curl
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS bloqueado: " + origin), false);
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-  })
-);
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("CORS bloqueado"));
+    }
+  }
+}));
+;
 
 app.set("trust proxy", 1);
 
@@ -183,3 +184,4 @@ Formato exato:
 app.listen(PORT, () => {
   console.log("MSM-IA-API a correr na porta", PORT);
 });
+
