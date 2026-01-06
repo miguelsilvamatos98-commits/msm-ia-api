@@ -6,20 +6,20 @@ import OpenAI from "openai";
 const app = express();
 
 /* ===============================
-   CONFIG UPLOAD (IMAGEM)
+   UPLOAD CONFIG
 ================================ */
 const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 } // 5MB
 });
 
 /* ===============================
-   CORS – DOMÍNIOS AUTORIZADOS
+   CORS CONFIG (APENAS UMA VEZ)
 ================================ */
 const allowedOrigins = [
   "https://darkturquoise-stork-767325.hostingersite.com",
   "https://tradespeedpro.click",
-  "http://localhost:5500",
-  "http://localhost:3000"
+  "http://localhost:3000",
+  "http://localhost:5500"
 ];
 
 app.use(cors({
@@ -27,7 +27,7 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error("CORS bloqueado: " + origin));
+      callback(new Error("CORS bloqueado"));
     }
   }
 }));
@@ -42,7 +42,7 @@ const openai = new OpenAI({
 });
 
 /* ===============================
-   HEALTH CHECK
+   HEALTH
 ================================ */
 app.get("/health", (req, res) => {
   res.json({
@@ -53,10 +53,9 @@ app.get("/health", (req, res) => {
 });
 
 /* ===============================
-   ANALISAR GRÁFICO (POST)
-   RESPONDE APENAS:
-   - COMPRA
-   - VENDA
+   ANALISAR GRÁFICO
+   - SÓ COMPRA ou VENDA
+   - 1 MINUTO
 ================================ */
 app.post("/api/analisar-grafico", upload.single("grafico"), async (req, res) => {
   try {
@@ -72,20 +71,19 @@ app.post("/api/analisar-grafico", upload.single("grafico"), async (req, res) => 
         {
           role: "system",
           content: `
-És uma IA profissional de análise técnica para OPÇÕES BINÁRIAS.
-Objetivo: decidir operação de 1 MINUTO.
+És um analista profissional de opções binárias.
+Decide operação de 1 minuto.
 
-Regras OBRIGATÓRIAS:
-- Responder APENAS "COMPRA" ou "VENDA"
-- Nunca responder NEUTRO, ERRO ou texto extra
-- Basear-se apenas no gráfico visível
-- Analisar micro-tendência, força, rejeições e candles recentes
+REGRAS:
+- Responde APENAS "COMPRA" ou "VENDA"
+- Nunca escrevas texto extra
+- Baseia-te apenas no gráfico
 `
         },
         {
           role: "user",
           content: [
-            { type: "text", text: "Analisa este gráfico e decide a operação." },
+            { type: "text", text: "Analisa o gráfico." },
             {
               type: "image_url",
               image_url: {
@@ -109,11 +107,9 @@ Regras OBRIGATÓRIAS:
       duracao: "1 minuto"
     });
 
-  } catch (error) {
-    console.error("Erro IA:", error);
-    res.status(500).json({
-      erro: "Erro interno na análise"
-    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: "Erro interno" });
   }
 });
 
