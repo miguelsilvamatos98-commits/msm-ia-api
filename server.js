@@ -1,74 +1,76 @@
 import express from "express";
-import multer from "multer";
 import cors from "cors";
-import fetch from "node-fetch";
-import FormData from "form-data";
+import multer from "multer";
 
 const app = express();
-const upload = multer();
-
 app.use(cors());
 
-const AI_URL = process.env.AI_PYTHON_URL; // ex: https://trade-speed-ai-python.onrender.com/predict
+const upload = multer({ storage: multer.memoryStorage() });
 
-app.get("/", (req, res) => res.json({ ok: true, service: "msm-ia-api" }));
-app.get("/health", (req, res) => res.json({ ok: true }));
+const PORT = process.env.PORT || 10000;
+
+// URL do serviço Python (Render)
+const AI_PYTHON_URL = process.env.AI_PYTHON_URL; // ex: https://trade-speed-ai-python.onrender.com
+
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "msm-ia-api-node" });
+});
 
 app.post("/api/analisar-grafico", upload.single("grafico"), async (req, res) => {
   try {
-    if (!AI_URL) {
-      return res.status(500).json({
-        error: "AI_PYTHON_URL não está definido no Environment do Render (Node).",
-      });
+    if (!AI_PYTHON_URL) {
+      return res.status(500).json({ ok: false, error: "AI_PYTHON_URL não definido no Render (Node)." });
     }
 
     if (!req.file) {
-      return res.status(400).json({ error: "Imagem não enviada (campo: grafico)" });
+      return res.status(400).json({ ok: false, error: "Ficheiro 'grafico' em falta." });
     }
 
-    const ativo = req.body.ativo || "EURUSD";
-    const duracao = req.body.duracao || "90";
+    const ativo = (req.body.ativo || "").toString();
+    const duracao = (req.body.duracao || "90").toString();
 
-    // Cria multipart para enviar ao Python
-    const formData = new FormData();
-    formData.append("grafico", req.file.buffer, {
-      filename: req.file.originalname || "grafico.png",
-      contentType: req.file.mimetype || "image/png",
-    });
-    formData.append("ativo", ativo);
-    formData.append("duracao", duracao);
+    // Node 18+ tem fetch/FormData/Blob globais
+    const form = new FormData();
+    const blob = new Blob([req.file.buffer], { type: req.file.mimetype || "image/jpeg" });
 
-    const resp = await fetch(AI_URL, {
+    form.append("grafico", blob, req.file.originalname || "grafico.jpg");
+    form.append("ativo", ativo);
+    form.append("duracao", duracao);
+
+    const url = `${AI_PYTHON_URL.replace(/\/$/, "")}/predict`;
+
+    const resp = await fetch(url, {
       method: "POST",
-      body: formData,
-      headers: formData.getHeaders(),
+      body: form,
     });
 
-    // Lê texto e tenta JSON (para nunca dar "Unexpected token <")
-    const text = await resp.text();
-
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
+    const contentType = resp.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      const raw = await resp.text();
       return res.status(502).json({
-        error: "Python não devolveu JSON (provavelmente devolveu HTML/erro).",
-        status: resp.status,
-        details: text.slice(0, 300),
+        ok: false,
+        error: "Resposta inválida do serviço Python (não é JSON).",
+        details: raw.slice(0, 400),
       });
     }
 
-    // Se Python devolveu erro mas em JSON
-    if (!resp.ok) {
-      return res.status(resp.status).json(data);
+    const data = await resp.json();
+
+    // devolve ao front exatamente o JSON padronizado
+    if (!data?.ok) {
+      return res.status(502).json(data);
     }
 
     return res.json(data);
-  } catch (err) {
-    console.error("❌ Erro no Node:", err);
-    return res.status(500).json({ error: "Erro no Node", details: err.message });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: "Erro ao comunicar com a IA",
+      details: String(e?.message || e),
+    });
   }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("✅ msm-ia-api a correr na porta", PORT));
+app.listen(PORT, () => {
+  console.log(`✅ Node API a correr na porta ${PORT}`);
+});
