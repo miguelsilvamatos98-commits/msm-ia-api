@@ -1,19 +1,24 @@
 import os
-import json
-from typing import Optional
-
-from fastapi import FastAPI, UploadFile, File, Form
+import base64
+from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-
 from PIL import Image
 import io
 
 from openai import OpenAI
 
-app = FastAPI(title="trade-speed-ai-python", version="0.1.0")
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# CORS (podes restringir depois ao teu domínio)
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY não definida")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,169 +27,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def _safe_int(v, default: int):
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-def _clamp(n: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, n))
-
-def _normalize_signal(s: str) -> str:
-    s = (s or "").strip().upper()
-    if "COMPRA" in s:
-        return "COMPRA"
-    if "VENDA" in s:
-        return "VENDA"
-    if "SEM" in s:
-        return "SEM SINAL"
-    return "SEM SINAL"
-
-def _extract_json(text: str) -> Optional[dict]:
-    """
-    Tenta extrair JSON mesmo que o modelo escreva texto extra.
-    """
-    if not text:
-        return None
-    text = text.strip()
-
-    # caso já seja JSON puro
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # tenta localizar o primeiro {...} completo
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(text[start : end + 1])
-        except Exception:
-            return None
-
-    return None
-
+# ─────────────────────────────────────────────
+# ROOT (health)
+# ─────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"ok": True, "service": "ai-python"}
 
+# ─────────────────────────────────────────────
+# PREDICT
+# ─────────────────────────────────────────────
 @app.post("/predict")
 async def predict(
-    grafico: UploadFile = File(...),
-    ativo: str = Form("EURUSD"),
-    duracao: str = Form("90"),
+    grafico: UploadFile,
+    ativo: str = Form(...),
+    duracao: int = Form(...)
 ):
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return JSONResponse(
-            status_code=200,
-            content={"ok": False, "error": "OPENAI_API_KEY em falta no serviço Python."},
-        )
-
-    # ler imagem
     try:
-        raw = await grafico.read()
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception:
-        return JSONResponse(
-            status_code=200,
-            content={"ok": False, "error": "Não foi possível ler o ficheiro de imagem."},
-        )
+        # ── ler imagem
+        image_bytes = await grafico.read()
 
-    # opcional: reduzir tamanho (mais rápido/barato)
-    try:
-        max_w = 1280
-        if img.width > max_w:
-            ratio = max_w / float(img.width)
-            new_h = int(img.height * ratio)
-            img = img.resize((max_w, new_h))
-    except Exception:
-        pass
+        # validar imagem
+        img = Image.open(io.BytesIO(image_bytes))
+        img.verify()
 
-    # re-encode PNG
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    png_bytes = buf.getvalue()
+        # converter para base64
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    dur_s = _clamp(_safe_int(duracao, 90), 30, 300)
-    ativo_norm = (ativo or "EURUSD").strip().upper()
-
-    client = OpenAI(api_key=api_key)
-
-    # IMPORTANTE:
-    # - Não dá para garantir “dizer exatamente o que vai acontecer”.
-    # - Aqui a IA só faz leitura do print e devolve sinal com confiança.
-    # - Para não ficar sempre 60%, pedimos escala + justificativa curta e forçamos JSON.
-    prompt = f"""
-Vais analisar um PRINT do Pocket Option (gráfico de candles).
-Objetivo: devolver um JSON ESTRITO (sem texto fora do JSON) com:
-- ok: true
-- sinal: "COMPRA" ou "VENDA" ou "SEM SINAL"
-- confianca: inteiro 0-100 (não uses sempre 60; usa a escala completa)
-- ativo: "{ativo_norm}"
-- duracao_segundos: {dur_s}
-- motivo_curto: string curta (máx 120 caracteres) explicando o porquê
-
-Regras:
-- Se o print estiver desfocado, cortado, ou sem contexto suficiente -> sinal = "SEM SINAL" e confiança <= 55.
-- Só dá "COMPRA" ou "VENDA" se houver um padrão razoável (tendência + pullback / suporte-resistência / rejeição).
-- A resposta TEM de ser JSON válido. Nada de markdown.
-"""
-
-    try:
-        # Responses API com imagem (vision)
-        resp = client.responses.create(
+        # ─────────────────────────────────────────
+        # OPENAI — API NOVA (Responses)
+        # ─────────────────────────────────────────
+        response = client.responses.create(
             model="gpt-4.1-mini",
             input=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": prompt},
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Analisa o gráfico de candlesticks para opções binárias.\n"
+                                "Responde APENAS em JSON com este formato:\n\n"
+                                "{\n"
+                                '  "sinal": "COMPRA | VENDA | SEM SINAL",\n'
+                                '  "confianca": numero de 0 a 100\n'
+                                "}\n\n"
+                                f"Ativo: {ativo}\n"
+                                f"Duração: {duracao} segundos\n"
+                            )
+                        },
                         {
                             "type": "input_image",
-                            "image_data": png_bytes,  # SDK aceita bytes
-                        },
-                    ],
+                            "image_base64": image_b64
+                        }
+                    ]
                 }
-            ],
+            ]
         )
 
-        # texto de saída
-        out_text = ""
-        try:
-            out_text = resp.output_text
-        except Exception:
-            # fallback
-            out_text = str(resp)
+        # ── extrair texto final
+        output_text = response.output_text.strip()
 
-        data = _extract_json(out_text)
-        if not isinstance(data, dict):
-            return JSONResponse(
-                status_code=200,
-                content={"ok": False, "error": "Resposta inválida do modelo (não veio JSON).", "raw": out_text[:400]},
-            )
+        # tentar converter JSON
+        import json
+        data = json.loads(output_text)
 
-        sinal = _normalize_signal(str(data.get("sinal", "")))
-        conf = _clamp(_safe_int(data.get("confianca", 50), 50), 0, 100)
-        motivo = str(data.get("motivo_curto", "")).strip()[:120]
-
-        # regra extra: se SEM SINAL, baixa teto de confiança
-        if sinal == "SEM SINAL":
-            conf = min(conf, 55)
+        sinal = data.get("sinal", "SEM SINAL")
+        confianca = int(data.get("confianca", 50))
 
         return {
             "ok": True,
             "sinal": sinal,
-            "confianca": conf,
-            "ativo": ativo_norm,
-            "duracao_segundos": dur_s,
-            "motivo_curto": motivo,
+            "confianca": confianca,
+            "ativo": ativo,
+            "duracao_segundos": duracao
         }
 
     except Exception as e:
-        return JSONResponse(
-            status_code=200,
-            content={"ok": False, "error": "Erro ao comunicar com a IA.", "details": str(e)[:300]},
-        )
+        return {
+            "ok": False,
+            "error": "Erro ao comunicar com a IA.",
+            "details": str(e)
+        }
