@@ -1,27 +1,68 @@
 import os
-import base64
+import re
 import json
+import base64
+from typing import Optional, Any, Dict
+
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+
 from openai import OpenAI
+
 
 app = FastAPI(title="AI Python", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # podes restringir depois
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 def _to_data_url(file_bytes: bytes, mime: str) -> str:
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
+
+def _extract_json(text: str) -> Dict[str, Any]:
+    """
+    Tenta apanhar JSON mesmo que o modelo devolva texto com lixo à volta.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}
+
+    # caso venha com ```json ... ```
+    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    # tenta direto
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # tenta encontrar primeiro bloco {...}
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            return {}
+
+    return {}
+
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "ai-python"}
+
 
 @app.post("/predict")
 async def predict(
@@ -31,7 +72,7 @@ async def predict(
 ):
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        return {"ok": False, "erro": "OPENAI_API_KEY em falta no serviço Python."}
+        return {"ok": False, "error": "OPENAI_API_KEY em falta no servico Python."}
 
     # ler imagem
     try:
@@ -39,29 +80,28 @@ async def predict(
         mime = grafico.content_type or "image/png"
         data_url = _to_data_url(img_bytes, mime)
     except Exception as e:
-        return {"ok": False, "erro": "Falha ao ler imagem", "details": str(e)}
+        return {"ok": False, "error": "Falha ao ler imagem", "details": str(e)}
 
     ativo_txt = (ativo or "").strip()
 
-    # prompt (força JSON)
     prompt = (
         "Analisa a imagem do gráfico (candlesticks) para opções binárias.\n"
-        "Responde APENAS com um JSON válido (sem texto extra) exatamente neste formato:\n"
-        "{\n"
-        '  "sinal": "COMPRA|VENDA|SEM SINAL",\n'
-        '  "confianca": 0-100,\n'
-        '  "motivo": "curto"\n'
-        "}\n"
+        "Responde APENAS em JSON (sem texto extra) com esta estrutura:\n"
+        '{ "sinal":"COMPRA|VENDA|SEM SINAL", "confianca":0-100, "motivo":"curto" }\n'
         f"Ativo: {ativo_txt}\n"
         f"Duração (segundos): {duracao}\n"
         "Regras:\n"
         "- Se não houver padrão claro, usa SEM SINAL.\n"
-        "- 'confianca' tem de ser inteiro.\n"
+        "- confianca tem de ser número inteiro (0-100).\n"
     )
 
     try:
         client = OpenAI(api_key=api_key)
 
+        # ✅ IMPORTANTE:
+        # - Nada de image_base64
+        # - Nada de response_format
+        # - Usa input_image com image_url "data:..."
         r = client.responses.create(
             model="gpt-4.1-mini",
             input=[
@@ -78,48 +118,37 @@ async def predict(
 
         text = (getattr(r, "output_text", "") or "").strip()
         if not text:
-            return {"ok": False, "erro": "Resposta vazia do modelo."}
+            return {"ok": False, "error": "Resposta vazia do modelo."}
 
-        # tenta interpretar JSON (mesmo se vier com lixo)
-        parsed = None
+        obj = _extract_json(text)
+
+        sinal = str(obj.get("sinal", "")).strip().upper()
+        conf = obj.get("confianca", None)
+        motivo = str(obj.get("motivo", "")).strip()
+
+        # validação final
         try:
-            parsed = json.loads(text)
-        except:
-            # fallback: tenta extrair o primeiro bloco JSON dentro do texto
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    parsed = json.loads(text[start:end+1])
-                except:
-                    parsed = None
+            conf_int = int(conf)
+        except Exception:
+            conf_int = None
 
-        if not isinstance(parsed, dict):
-            return {"ok": False, "erro": "Modelo não devolveu JSON válido.", "raw": text}
+        if sinal not in ["COMPRA", "VENDA", "SEM SINAL"] or conf_int is None:
+            # devolve raw para debug (mas ainda assim 200 OK)
+            return {
+                "ok": False,
+                "error": "Resposta inválida do modelo (não veio JSON válido).",
+                "raw": text,
+            }
 
-        sinal = str(parsed.get("sinal", "")).upper().strip()
-        conf = parsed.get("confianca", None)
-        motivo = str(parsed.get("motivo", "")).strip()
-
-        try:
-            conf_int = int(round(float(conf)))
-        except:
-            return {"ok": False, "erro": "JSON inválido: confiança ausente/ inválida.", "raw": text}
-
-        if sinal not in ["COMPRA", "VENDA", "SEM SINAL"]:
-            # normaliza se vier algo estranho
-            sinal = "SEM SINAL"
-
-        conf_int = max(0, min(100, conf_int))
-
+        # ✅ resposta final “bonita” para o Node/HTML
         return {
             "ok": True,
             "sinal": sinal,
             "confianca": conf_int,
-            "motivo": motivo[:220],
+            "motivo": motivo,
             "ativo": ativo_txt,
             "duracao_segundos": int(duracao),
         }
 
     except Exception as e:
-        return {"ok": False, "erro": "Erro ao comunicar com a IA.", "details": str(e)}
+        return {"ok": False, "error": "Erro ao comunicar com a IA.", "details": str(e)}
