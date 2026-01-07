@@ -3,74 +3,84 @@ import cors from "cors";
 import multer from "multer";
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: "*" }));
 
-const upload = multer({ storage: multer.memoryStorage() });
-
-const PORT = process.env.PORT || 10000;
-
-// URL do serviço Python (Render)
-const AI_PYTHON_URL = process.env.AI_PYTHON_URL; // ex: https://trade-speed-ai-python.onrender.com
-
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "msm-ia-api-node" });
+// multer em memória (buffer)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 } // 8MB
 });
 
+const PORT = process.env.PORT || 10000;
+const AI_PYTHON_URL = (process.env.AI_PYTHON_URL || "").replace(/\/+$/, ""); // sem "/" no fim
+
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "msm-ia-api" });
+});
+
+app.get("/health", async (req, res) => {
+  try {
+    if (!AI_PYTHON_URL) return res.status(200).json({ ok: true, node: "ok", python: "missing AI_PYTHON_URL" });
+
+    const r = await fetch(`${AI_PYTHON_URL}/`, { method: "GET" });
+    const t = await r.text();
+    res.status(200).json({ ok: true, node: "ok", python_status: r.status, python_body: t.slice(0, 200) });
+  } catch (e) {
+    res.status(200).json({ ok: true, node: "ok", python_error: String(e).slice(0, 200) });
+  }
+});
+
+// recebe o print do teu site e envia para o Python
 app.post("/api/analisar-grafico", upload.single("grafico"), async (req, res) => {
   try {
     if (!AI_PYTHON_URL) {
-      return res.status(500).json({ ok: false, error: "AI_PYTHON_URL não definido no Render (Node)." });
+      return res.status(500).json({ ok: false, error: "AI_PYTHON_URL não configurado no Node (Render)." });
     }
 
-    if (!req.file) {
+    if (!req.file || !req.file.buffer) {
       return res.status(400).json({ ok: false, error: "Ficheiro 'grafico' em falta." });
     }
 
-    const ativo = (req.body.ativo || "").toString();
+    const ativo = (req.body.ativo || "EURUSD").toString();
     const duracao = (req.body.duracao || "90").toString();
 
-    // Node 18+ tem fetch/FormData/Blob globais
-    const form = new FormData();
-    const blob = new Blob([req.file.buffer], { type: req.file.mimetype || "image/jpeg" });
+    // Node 22 tem FormData/Blob/File nativos
+    const fd = new FormData();
+    const blob = new Blob([req.file.buffer], { type: req.file.mimetype || "image/png" });
+    const filename = req.file.originalname || "grafico.png";
 
-    form.append("grafico", blob, req.file.originalname || "grafico.jpg");
-    form.append("ativo", ativo);
-    form.append("duracao", duracao);
+    fd.append("grafico", blob, filename);
+    fd.append("ativo", ativo);
+    fd.append("duracao", duracao);
 
-    const url = `${AI_PYTHON_URL.replace(/\/$/, "")}/predict`;
-
-    const resp = await fetch(url, {
+    const r = await fetch(`${AI_PYTHON_URL}/predict`, {
       method: "POST",
-      body: form,
+      body: fd
     });
 
-    const contentType = resp.headers.get("content-type") || "";
-    if (!contentType.includes("application/json")) {
-      const raw = await resp.text();
+    const text = await r.text();
+
+    // tenta JSON
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
       return res.status(502).json({
         ok: false,
-        error: "Resposta inválida do serviço Python (não é JSON).",
-        details: raw.slice(0, 400),
+        error: "Resposta não-JSON do serviço Python",
+        details: text.slice(0, 250)
       });
     }
 
-    const data = await resp.json();
+    // devolve exatamente o que veio do Python
+    return res.status(200).json(data);
 
-    // devolve ao front exatamente o JSON padronizado
-    if (!data?.ok) {
-      return res.status(502).json(data);
-    }
-
-    return res.json(data);
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: "Erro ao comunicar com a IA",
-      details: String(e?.message || e),
-    });
+    return res.status(500).json({ ok: false, error: "Erro no Node ao encaminhar para Python.", details: String(e).slice(0, 250) });
   }
 });
 
 app.listen(PORT, () => {
   console.log(`✅ Node API a correr na porta ${PORT}`);
+  console.log(`➡️ AI_PYTHON_URL=${AI_PYTHON_URL || "(vazio)"}`);
 });
