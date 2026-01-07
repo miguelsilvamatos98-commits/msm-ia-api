@@ -1,5 +1,7 @@
-fastapi
-uvicorn
-python-multipart
-pillow
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+pillow==11.0.0
+openai==1.57.0
+
 
