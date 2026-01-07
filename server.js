@@ -3,84 +3,81 @@ import cors from "cors";
 import multer from "multer";
 
 const app = express();
-app.use(cors({ origin: "*" }));
+app.use(cors({ origin: "*"}));
 
-// multer em memória (buffer)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 } // 8MB
-});
+const upload = multer({ storage: multer.memoryStorage() });
 
-const PORT = process.env.PORT || 10000;
-const AI_PYTHON_URL = (process.env.AI_PYTHON_URL || "").replace(/\/+$/, ""); // sem "/" no fim
+const AI_PYTHON_URL = process.env.AI_PYTHON_URL; // ex: https://trade-speed-ai-python.onrender.com
+if (!AI_PYTHON_URL) {
+  console.error("FALTA AI_PYTHON_URL no ambiente do Node.");
+}
 
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "msm-ia-api" });
-});
+app.get("/", (req, res) => res.json({ ok: true, service: "msm-ia-api" }));
 
-app.get("/health", async (req, res) => {
-  try {
-    if (!AI_PYTHON_URL) return res.status(200).json({ ok: true, node: "ok", python: "missing AI_PYTHON_URL" });
-
-    const r = await fetch(`${AI_PYTHON_URL}/`, { method: "GET" });
-    const t = await r.text();
-    res.status(200).json({ ok: true, node: "ok", python_status: r.status, python_body: t.slice(0, 200) });
-  } catch (e) {
-    res.status(200).json({ ok: true, node: "ok", python_error: String(e).slice(0, 200) });
-  }
-});
-
-// recebe o print do teu site e envia para o Python
 app.post("/api/analisar-grafico", upload.single("grafico"), async (req, res) => {
   try {
     if (!AI_PYTHON_URL) {
-      return res.status(500).json({ ok: false, error: "AI_PYTHON_URL não configurado no Node (Render)." });
+      return res.status(500).json({ ok: false, error: "AI_PYTHON_URL não definido no Node." });
     }
-
-    if (!req.file || !req.file.buffer) {
+    if (!req.file) {
       return res.status(400).json({ ok: false, error: "Ficheiro 'grafico' em falta." });
     }
 
-    const ativo = (req.body.ativo || "EURUSD").toString();
-    const duracao = (req.body.duracao || "90").toString();
+    const ativo = (req.body?.ativo || "").toString();
+    const duracao = parseInt(req.body?.duracao || "90", 10);
 
-    // Node 22 tem FormData/Blob/File nativos
-    const fd = new FormData();
+    // FormData global (Node 18+ / 20+ / 22+)
+    const form = new FormData();
     const blob = new Blob([req.file.buffer], { type: req.file.mimetype || "image/png" });
-    const filename = req.file.originalname || "grafico.png";
+    form.append("grafico", blob, req.file.originalname || "grafico.png");
+    form.append("ativo", ativo);
+    form.append("duracao", String(Number.isFinite(duracao) ? duracao : 90));
 
-    fd.append("grafico", blob, filename);
-    fd.append("ativo", ativo);
-    fd.append("duracao", duracao);
+    const url = `${AI_PYTHON_URL.replace(/\/$/, "")}/predict`;
 
-    const r = await fetch(`${AI_PYTHON_URL}/predict`, {
-      method: "POST",
-      body: fd
-    });
+    const r = await fetch(url, { method: "POST", body: form });
+    const data = await r.json().catch(() => null);
 
-    const text = await r.text();
-
-    // tenta JSON
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
+    if (!r.ok || !data) {
       return res.status(502).json({
         ok: false,
-        error: "Resposta não-JSON do serviço Python",
-        details: text.slice(0, 250)
+        error: "Falha ao chamar serviço Python",
+        status: r.status,
+        details: data || "Resposta não-JSON do Python",
       });
     }
 
-    // devolve exatamente o que veio do Python
-    return res.status(200).json(data);
+    // O Python devolve {ok:true, raw:"{...json...}"}
+    if (!data.ok) {
+      return res.status(500).json(data);
+    }
+
+    // Tentar extrair JSON do raw
+    let parsed = null;
+    try {
+      parsed = JSON.parse(data.raw);
+    } catch {
+      // se vier algo não-JSON, devolve como raw
+      return res.json({ ok: true, raw: data.raw });
+    }
+
+    // Normalizar saída final que o teu frontend espera
+    const sinal = (parsed.sinal || "SEM SINAL").toString().toUpperCase();
+    const confianca = Number(parsed.confianca ?? 0);
+
+    return res.json({
+      ok: true,
+      sinal,
+      confianca: Number.isFinite(confianca) ? confianca : 0,
+      motivo: parsed.motivo || "",
+      ativo,
+      duracao_segundos: Number.isFinite(duracao) ? duracao : 90,
+    });
 
   } catch (e) {
-    return res.status(500).json({ ok: false, error: "Erro no Node ao encaminhar para Python.", details: String(e).slice(0, 250) });
+    return res.status(500).json({ ok: false, error: "Erro interno no Node", details: String(e) });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Node API a correr na porta ${PORT}`);
-  console.log(`➡️ AI_PYTHON_URL=${AI_PYTHON_URL || "(vazio)"}`);
-});
+const port = process.env.PORT || 10000;
+app.listen(port, () => console.log("Node API a correr na porta", port));
