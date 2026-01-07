@@ -1,22 +1,15 @@
 import os
-import json
 import base64
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from openai import OpenAI
 
+app = FastAPI(title="AI Python", version="1.0.0")
 
-# ---------- Config ----------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-
-app = FastAPI(title="trade-speed-ai-python", version="1.0.0")
-
-# CORS (ajusta se quiseres restringir ao teu domínio)
+# CORS (podes apertar depois)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,42 +18,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-def _data_url_from_bytes(image_bytes: bytes, mime: str = "image/png") -> str:
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
+def _to_data_url(file_bytes: bytes, mime: str) -> str:
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
-
-
-def _safe_json_parse(text: str) -> Optional[dict]:
-    """
-    Tenta extrair JSON mesmo que venha com texto extra.
-    """
-    text = (text or "").strip()
-    if not text:
-        return None
-
-    # Caso venha JSON puro
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # Caso venha com lixo antes/depois
-    first = text.find("{")
-    last = text.rfind("}")
-    if first != -1 and last != -1 and last > first:
-        try:
-            return json.loads(text[first : last + 1])
-        except Exception:
-            return None
-
-    return None
-
 
 @app.get("/")
 def root():
     return {"ok": True, "service": "ai-python"}
-
 
 @app.post("/predict")
 async def predict(
@@ -68,116 +32,60 @@ async def predict(
     ativo: str = Form(""),
     duracao: int = Form(90),
 ):
-    # 1) validações básicas
-    if not OPENAI_API_KEY:
-        return JSONResponse(
-            status_code=200,
-            content={"ok": False, "error": "OPENAI_API_KEY em falta no serviço Python."},
-        )
+    # 1) Key
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return {"ok": False, "error": "OPENAI_API_KEY em falta no servico Python."}
 
+    # 2) Ler imagem
     try:
-        image_bytes = await grafico.read()
-        if not image_bytes:
-            return JSONResponse(
-                status_code=200,
-                content={"ok": False, "error": "Ficheiro de imagem vazio."},
-            )
-
-        # tenta manter content-type do upload (fallback png)
+        img_bytes = await grafico.read()
         mime = grafico.content_type or "image/png"
-        if not mime.startswith("image/"):
-            mime = "image/png"
+        data_url = _to_data_url(img_bytes, mime)
+    except Exception as e:
+        return {"ok": False, "error": "Falha ao ler imagem", "details": str(e)}
 
-        image_data_url = _data_url_from_bytes(image_bytes, mime=mime)
+    # 3) Prompt
+    ativo_txt = ativo.strip() if ativo else ""
+    prompt = (
+        "Analisa a imagem do gráfico (candlesticks) para opções binárias.\n"
+        "Responde APENAS em JSON com esta estrutura:\n"
+        "{\n"
+        '  "sinal": "COMPRA|VENDA|SEM SINAL",\n'
+        '  "confianca": 0-100,\n'
+        '  "motivo": "curto"\n'
+        "}\n"
+        f"Ativo: {ativo_txt}\n"
+        f"Duração (segundos): {duracao}\n"
+        "Regras:\n"
+        "- Se não houver padrão claro, usa SEM SINAL.\n"
+        "- Confianca deve ser um número inteiro.\n"
+    )
 
-        # 2) prompt (força JSON estrito)
-        prompt = f"""
-Analisa o print do gráfico (candlesticks) e devolve UM JSON válido (sem texto extra) no formato:
+    # 4) OpenAI Responses (AQUI fica o client.responses.create)
+    try:
+        client = OpenAI(api_key=api_key)
 
-{{
-  "sinal": "COMPRA" | "VENDA" | "SEM SINAL",
-  "confianca": número de 0 a 100,
-  "motivo": "curto (1 frase)"
-}}
-
-Contexto:
-- Ativo: {ativo or "desconhecido"}
-- Duração: {duracao} segundos
-Regras:
-- Se a confiança for < 75, usa "SEM SINAL".
-- NÃO devolvas markdown. Apenas JSON.
-""".strip()
-
-        # 3) chamada OpenAI (Responses API com input_image + image_url base64)
-        client = OpenAI(api_key=OPENAI_API_KEY)
-
-        resp = client.responses.create(
-            model=MODEL,
+        r = client.responses.create(
+            model="gpt-4.1-mini",
             input=[
                 {
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": image_data_url},
+                        {"type": "input_image", "image_url": data_url},
                     ],
                 }
             ],
-            # opcional: limita custo/saída
             max_output_tokens=200,
         )
 
-        out_text = (resp.output_text or "").strip()
+        text = (r.output_text or "").strip()
+        if not text:
+            return {"ok": False, "error": "Resposta vazia do modelo."}
 
-        data = _safe_json_parse(out_text)
-        if not data:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "ok": False,
-                    "error": "Resposta inválida do serviço de IA (JSON não encontrado).",
-                    "raw": out_text[:500],
-                },
-            )
-
-        sinal = (data.get("sinal") or "").strip().upper()
-        confianca = data.get("confianca")
-
-        # normalizações
-        if sinal not in {"COMPRA", "VENDA", "SEM SINAL"}:
-            sinal = "SEM SINAL"
-
-        try:
-            confianca = int(float(confianca))
-        except Exception:
-            confianca = None
-
-        if confianca is None:
-            return JSONResponse(
-                status_code=200,
-                content={"ok": False, "error": "Resposta inválida: confiança ausente.", "raw": data},
-            )
-
-        # aplica regra final
-        if confianca < 75:
-            sinal = "SEM SINAL"
-
-        return {
-            "ok": True,
-            "sinal": sinal,
-            "confianca": confianca,
-            "ativo": (ativo or "").upper(),
-            "duracao_segundos": int(duracao),
-            "motivo": (data.get("motivo") or "").strip(),
-            "meta": {
-                "filename": grafico.filename,
-                "mime": mime,
-                "model": MODEL,
-            },
-        }
+        # Se vier JSON puro, ótimo. Se vier texto extra, devolvemos raw.
+        return {"ok": True, "raw": text}
 
     except Exception as e:
-        # NUNCA devolver HTML — sempre JSON
-        return JSONResponse(
-            status_code=200,
-            content={"ok": False, "error": "Erro ao comunicar com a IA.", "details": str(e)},
-        )
+        return {"ok": False, "error": "Erro ao comunicar com a IA.", "details": str(e)}
