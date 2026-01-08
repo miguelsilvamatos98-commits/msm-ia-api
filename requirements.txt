@@ -1,6 +1,7 @@
 fastapi
-uvicorn
-openai
+uvicorn[standard]
 python-multipart
+openai
+
 
 
