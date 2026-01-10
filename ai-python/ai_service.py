@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3
@@ -39,6 +39,9 @@ def init_db():
 
 init_db()
 
+# ✅ senha para reset (mete no Render como env var)
+RESET_KEY = os.environ.get("RESET_KEY", "1337")
+
 class FeedbackIn(BaseModel):
     ts: int
     page: str | None = None
@@ -66,11 +69,8 @@ async def predict(
     """
 
     # EXEMPLO (troca pela tua IA real):
-    # - Vamos simular uma resposta só para não dar erro.
-    # - Aqui era onde tu lias a imagem, extraías padrões, etc.
     _ = await grafico.read()
 
-    # exemplo simples:
     sinal = "COMPRA"
     confianca = 70
     motivo = "exemplo: reversão após queda"
@@ -86,7 +86,6 @@ async def predict(
 
 @app.post("/feedback")
 def feedback(data: FeedbackIn):
-    # valida outcome
     outcome = data.outcome.upper().strip()
     if outcome not in ("WIN", "LOSE"):
         return {"ok": False, "error": "outcome inválido. Use WIN ou LOSE."}
@@ -126,3 +125,20 @@ def feedback_stats():
 
     conn.close()
     return {"ok": True, "total": total, "win": win, "lose": lose}
+
+# ===========================
+# ✅ RESET COM SENHA (HEADER)
+# ===========================
+@app.post("/feedback/reset")
+def feedback_reset(x_reset_key: str = Header(default="", alias="X-Reset-Key")):
+    # tens de enviar o header: X-Reset-Key: <a_tua_senha>
+    if not x_reset_key or x_reset_key != RESET_KEY:
+        return {"ok": False, "error": "Unauthorized"}
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM feedback")
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "message": "Feedback resetado com sucesso."}
