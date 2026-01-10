@@ -1,13 +1,24 @@
-from fastapi import FastAPI, File, Form, UploadFile, Header
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3
-import time
 import os
+import time
 
-app = FastAPI(title="Trade Speed AI")
+# ===============================
+# CONFIG
+# ===============================
 
-# CORS (para o teu site conseguir chamar a API)
+APP_NAME = "Trade Speed AI"
+RESET_PASSWORD = os.environ.get("FEEDBACK_RESET_PASSWORD", "msm-reset-123")
+DB_PATH = os.environ.get("FEEDBACK_DB_PATH", "feedback.db")
+
+# ===============================
+# APP
+# ===============================
+
+app = FastAPI(title=APP_NAME)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,64 +27,84 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = os.environ.get("FEEDBACK_DB_PATH", "feedback.db")
+# ===============================
+# DATABASE
+# ===============================
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-      CREATE TABLE IF NOT EXISTS feedback (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts INTEGER,
-        page TEXT,
-        outcome TEXT,
-        sinal TEXT,
-        confianca INTEGER,
-        motivo TEXT,
-        ativo TEXT,
-        duracao_segundos INTEGER
-      )
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER,
+            page TEXT,
+            outcome TEXT,
+            sinal TEXT,
+            confianca INTEGER,
+            motivo TEXT,
+            ativo TEXT,
+            duracao_segundos INTEGER
+        )
     """)
     conn.commit()
     conn.close()
 
 init_db()
 
-# ✅ senha para reset (mete no Render como env var)
-RESET_KEY = os.environ.get("RESET_KEY", "1337")
+# ===============================
+# MODELS
+# ===============================
 
 class FeedbackIn(BaseModel):
     ts: int
     page: str | None = None
-    outcome: str  # "WIN" or "LOSE"
+    outcome: str  # WIN | LOSE
     sinal: str | None = None
     confianca: int | None = None
     motivo: str | None = None
     ativo: str | None = None
     duracao_segundos: int | None = None
 
+
+class ResetIn(BaseModel):
+    password: str
+
+
+# ===============================
+# ROUTES
+# ===============================
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "trade-speed-ai-python"}
 
+
+# -------------------------------
+# IA PREDICT
+# -------------------------------
 @app.post("/predict")
 async def predict(
     grafico: UploadFile = File(...),
     ativo: str = Form("EURUSD"),
-    duracao: int = Form(90),
+    duracao: int = Form(60),  # agora default 60s
 ):
     """
-    Aqui tens a tua lógica de IA.
-    Mantém a tua implementação real e garante que devolve:
-      ok, sinal, confianca, motivo, ativo, duracao_segundos
+    ⚠️ AQUI entra a tua IA real.
+    Este bloco é compatível com o HTML atual.
     """
 
-    # EXEMPLO (troca pela tua IA real):
+    # Lê a imagem (obrigatório para não dar erro)
     _ = await grafico.read()
 
-    sinal = "COMPRA"
-    confianca = 70
-    motivo = "exemplo: reversão após queda"
+    # 🔁 SIMULAÇÃO (troca pela tua IA real)
+    # Dica: nunca devolver confiança alta sempre
+    sinal = "SEM SINAL"
+    confianca = 72
+    motivo = "mercado indefinido / pullback sem confirmação"
+
+    if confianca >= 85:
+        sinal = "COMPRA"
 
     return {
         "ok": True,
@@ -84,36 +115,45 @@ async def predict(
         "duracao_segundos": int(duracao),
     }
 
+
+# -------------------------------
+# FEEDBACK
+# -------------------------------
 @app.post("/feedback")
 def feedback(data: FeedbackIn):
     outcome = data.outcome.upper().strip()
     if outcome not in ("WIN", "LOSE"):
-        return {"ok": False, "error": "outcome inválido. Use WIN ou LOSE."}
+        raise HTTPException(status_code=400, detail="Outcome inválido")
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-      INSERT INTO feedback (ts, page, outcome, sinal, confianca, motivo, ativo, duracao_segundos)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO feedback (ts, page, outcome, sinal, confianca, motivo, ativo, duracao_segundos)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         int(data.ts),
         data.page,
         outcome,
         data.sinal,
-        int(data.confianca) if data.confianca is not None else None,
+        data.confianca,
         data.motivo,
         data.ativo,
-        int(data.duracao_segundos) if data.duracao_segundos is not None else None
+        data.duracao_segundos
     ))
     conn.commit()
     conn.close()
 
     return {"ok": True}
 
+
+# -------------------------------
+# FEEDBACK STATS
+# -------------------------------
 @app.get("/feedback/stats")
 def feedback_stats():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
     cur.execute("SELECT COUNT(*) FROM feedback")
     total = cur.fetchone()[0] or 0
 
@@ -124,16 +164,22 @@ def feedback_stats():
     lose = cur.fetchone()[0] or 0
 
     conn.close()
-    return {"ok": True, "total": total, "win": win, "lose": lose}
 
-# ===========================
-# ✅ RESET COM SENHA (HEADER)
-# ===========================
+    return {
+        "ok": True,
+        "total": total,
+        "win": win,
+        "lose": lose
+    }
+
+
+# -------------------------------
+# FEEDBACK RESET (COM SENHA)
+# -------------------------------
 @app.post("/feedback/reset")
-def feedback_reset(x_reset_key: str = Header(default="", alias="X-Reset-Key")):
-    # tens de enviar o header: X-Reset-Key: <a_tua_senha>
-    if not x_reset_key or x_reset_key != RESET_KEY:
-        return {"ok": False, "error": "Unauthorized"}
+def feedback_reset(data: ResetIn):
+    if data.password != RESET_PASSWORD:
+        raise HTTPException(status_code=401, detail="Password incorreta")
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -141,4 +187,4 @@ def feedback_reset(x_reset_key: str = Header(default="", alias="X-Reset-Key")):
     conn.commit()
     conn.close()
 
-    return {"ok": True, "message": "Feedback resetado com sucesso."}
+    return {"ok": True, "message": "Feedback resetado com sucesso"}
